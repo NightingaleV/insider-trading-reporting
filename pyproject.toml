@@ -1,25 +1,12 @@
-[tool.poetry]
+[project]
 name = "insider-stock-analysis"
 version = "0.1.0"
-description = ""
-authors = ["vitezslav.slavik <vitezslav.slavik@pwc.com>"]
+description = "Add your description here"
 readme = "README.md"
-
-[tool.poetry.dependencies]
-python = "^3.10"
-pandas = "^2.2.3"
-streamlit = "^1.41.1"
-langchain-openai = "^0.3.3"
-pydantic = "^2.10.6"
-plotly = "^6.0.0"
-fsspec = "^2024.12.0"
-chromadb = "^0.6.3"
-jupyter = "^1.1.1"
-instructor = "^1.7.2"
-openai = "^1.65.2"
-transformers = "^4.50.3"
-
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pandas>=2.2.3",
+    "pydantic>=2.11.5",
+    "pydantic-ai>=0.2.12",
+    "yfinance>=0.2.61",
+]

@@ -1,6 +1,8 @@
 ### Custom
-/env/**
-!/env/dev.template.env
+# Ignore all .env files directly in /env
+/env/*.env
+# But don’t ignore this specific file
+!/env/dev.env.example
 
 ### PyCharm template
 # Covers JetBrains IDEs: IntelliJ, RubyMine, PhpStorm, AppCode, PyCharm, CLion, Android Studio, WebStorm and Rider

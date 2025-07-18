@@ -234,87 +234,27 @@ class StockTradesAnalysis(BaseModel):
     def validate_trend(cls, v: str) -> MarketTrend:
         return MarketTrend._missing_(v)
     
-class TickerAnalysisResults(BaseModel):
+class InsiderTradingResults(BaseModel):
     """Results container for ticker-based analysis.
     
     Contains analysis for multiple tickers based on insider trading data.
     """
-    analyses: dict[str, StockTradesAnalysis] = Field(
+    tickers: dict[str, StockTradesAnalysis] = Field(
         ..., 
         description="Dictionary mapping ticker symbols to their trading analysis"
     )
     
     def get_analysis_for_ticker(self, ticker: str) -> StockTradesAnalysis | None:
         """Get analysis for a specific ticker."""
-        return self.analyses.get(ticker.upper())
+        return self.tickers.get(ticker.upper())
     
     def get_top_recommendations(self, n: int = 5) -> list[StockTradesAnalysis]:
         """Get top N recommendations sorted by total volume."""
         return sorted(
-            self.analyses.values(), 
+            self.tickers.values(), 
             key=lambda x: x.total_volume, 
             reverse=True
         )[:n]
-
-#%%
-class InsiderAnalystAgent:
-    """Factory class for creating a configured Agent for insider trading analysis.
-
-    This class encapsulates all configuration and prompt logic for the Insider Analyst agent.
-    Instantiating this class returns a configured Agent instance.
-
-    Example:
-        agent = InsiderAnalystAgent(name="Insider Analyst")
-    
-    !!! note
-        This pattern avoids subclassing final classes and keeps configuration modular.
-    """
-
-    SYSTEM_PROMPT = """You are an expert financial analyst specializing in insider trading data from US politicians. 
-    Your task is to analyze trades made by politicians and insiders, extract structured data, and provide investment recommendations based on trading patterns.
-    You will scrape data from Capitol Trades, process it into structured trades, and analyze the trading patterns to generate insights.
-    You will be provided with raw markdown content containing trade information. 
-
-    # Goal: 
-    Your goal is to extract the trades into a structured format and analyze them to provide insights on potential investment opportunities. 
-    """
-
-    DEFAULT_MODEL = "openai:gpt-4o-mini"
-    DEFAULT_NAME = "Insider Analyst"
-
-    def __new__(cls, *args, **kwargs):
-        """
-        Return a configured Agent instance for insider trading analysis.
-
-        Args:
-            *args: Positional arguments for Agent (unused).
-            **kwargs: Keyword arguments for Agent.
-
-        Returns:
-            Agent: Configured pydantic_ai Agent instance.
-        """
-        kwargs.setdefault("system_prompt", cls.SYSTEM_PROMPT)
-        kwargs.setdefault("model", cls.DEFAULT_MODEL)
-        kwargs.setdefault("name", cls.DEFAULT_NAME)
-        agent = Agent(**kwargs)
-        agent.tool_plain(cls.scrape_trades)
-        return agent
-    
-    @staticmethod
-    def scrape_trades() -> str:
-        """
-        Scrapes trades data from Capitol Trades for a given page number.
-        
-        Args:
-            page (int): Page number to scrape trades from. Default is 1.
-            
-        Returns:
-            TradesData: Structured data containing trades made by politicians or insiders.
-        """
-        from agentic_stock_analysis.config import ROOT_DIR
-        with open(ROOT_DIR / 'mocks' / 'capitol_trades_scrape_sample.txt', 'r') as f:
-            capitol_trades_raw_data = f.read()
-        return clean_capitol_trades_markdown(capitol_trades_raw_data)
 
 #%%
 class InsiderAnalystAgent:
@@ -362,6 +302,28 @@ class InsiderAnalystAgent:
     def _setup_tools(self):
         """Setup tools for the agent, including scraping trades."""
         self.agent.tool_plain(self.scrape_trades)
+        
+    def get_analysis_prompt(self, ticker, trades: list[Trade]) -> str:
+        """Get the system prompt for the agent."""
+        return f"""
+        Analyze the following trades for the ticker {ticker} specifically:
+        
+        ## Target {ticker} Trades
+        {trades}
+        
+        ## Task: Provide a comprehensive analysis including:
+        - Buy/sell ratio and volume analysis
+        - Market sentiment based on trades
+        
+        ## Guidance
+        - Use the provided trades to generate insights
+        - Dont mention information that is not present in the trades (e.g. no news, no earnings, no financials)
+        
+        ## Strategy
+        - Multiple different insiders trading the same stock is a stronger signal
+        - Latest trades are more relevant than older ones
+        - Consider the total volume of trades, not just counts        
+        """
     
     @staticmethod
     def scrape_trades() -> str:
@@ -405,16 +367,18 @@ class InsiderAnalystAgent:
         except Exception as e:
             logging.error(f"Error during trade extraction: {e}")
             
-    async def analyze_all_tickers(self, trades: TradesData) -> TickerAnalysisResults:
+    async def analyze_all_tickers(self, trades: TradesData) -> InsiderTradingResults:
         """Analyze all tickers present in the trades data.
         """
         df_trades = trades.to_df()
         if df_trades.empty:
             logging.warning("No trades data available for analysis.")
-            return TickerAnalysisResults(analyses={})
+            return InsiderTradingResults(tickers={})
         tickers = list(df_trades['ticker'].unique())   
+        logging.info(f"Starting analysis for {len(tickers)} unique tickers")
+        
         df_trades_agg = (
-            df_trades.groupby('ticker')
+            df_trades.groupby('ticker', as_index=False)
             .agg(
                 total_amount=('amount', 'sum'),
                 buy_count=('transaction_type', lambda x: (x == 'buy').sum()),
@@ -423,17 +387,24 @@ class InsiderAnalystAgent:
             )
             .sort_values(['buy_count', 'total_amount'], ascending=False)
             .head(10)
-        )     
-        if df_trades_agg.empty:
-            logging.warning(f"Same number of buy/sell trades found for ticker {ticker}. Skip analysis")
-            return None
-        logging.info(f"Starting analysis for {len(tickers)} unique tickers")
+        )
+        
+        trades_summary_str = str(df_trades_agg.to_dict('records'))
+        print(f"Trades summary: {trades_summary_str}")
+        @self.agent.system_prompt
+        def add_trades_summary() -> str:
+            """Add summary statistics to the trades DataFrame."""
+            print('trade summary:', trades_summary_str)
+            return """
+            ## Overall Trading Activity
+            Here's overall trading activity on market for all stocks in recent time to put things into context when analysing specific stock.
+            {trades_summary_str}
+            """
         analyses: dict[str, StockTradesAnalysis] = {}
         for ticker in tickers:
             try:
-                ticker_trades = df_trades[df_trades['ticker'] == ticker].sort_values('transaction_date', ascending=False).reset_index(drop=True)
-                all_ticker_summary = df_trades_agg
-                analysis = await self.analyze_ticker(ticker, ticker_trades, df_tickers=all_ticker_summary)
+                ticker_trades = [trade for trade in trades.trades if trade.ticker == ticker]
+                analysis = await self.analyze_ticker(ticker, ticker_trades)
                 if analysis is not None:
                     analyses[ticker] = analysis
                 logging.info(f"✅ Completed analysis for {ticker}")
@@ -441,9 +412,9 @@ class InsiderAnalystAgent:
                 logging.error(f"❌ Failed to analyze {ticker}: {e}")
                 continue
         logging.info(f"Analysis complete. Successfully analyzed {len(analyses)} tickers")
-        return TickerAnalysisResults(analyses=analyses)
+        return InsiderTradingResults(tickers=analyses)
             
-    async def analyze_ticker(self, ticker: str, df_trades: pd.DataFrame, df_tickers) -> Optional[StockTradesAnalysis]:
+    async def analyze_ticker(self, ticker: str, trades: list[Trade]) -> Optional[StockTradesAnalysis]:
         """Analyze trading patterns for a specific ticker.
         
         Args:
@@ -457,42 +428,8 @@ class InsiderAnalystAgent:
             ValueError: If no trades found for the specified ticker
             Exception: If analysis fails
         """
-        df_trades_agg = (
-            df_trades.groupby('ticker')
-            .agg(
-                total_amount=('amount', 'sum'),
-                buy_count=('transaction_type', lambda x: (x == 'buy').sum()),
-                sell_count=('transaction_type', lambda x: (x == 'sell').sum()),
-                last_trade_date=('transaction_date', 'max'),
-            )
-            .sort_values(['buy_count', 'total_amount'], ascending=False)
-            .head(10)
-        )
-        
         # If worthy of analysis, continue
-        trades_str = str(df_trades.to_dict('records'))
-        trades_summary_str = str(df_trades_agg.to_dict('records'))
-        # from agentic_stock_analysis.agents.utils import get_model_descriptions
-        query = f"""
-        Analyze the following trades for ticker {ticker}:
-        
-        ## Target Ticker Trades
-        {trades_str}
-        
-        ## Field Description for Trades
-        {get_model_descriptions(Trade)}
-        
-        Provide a comprehensive analysis including:
-        - Buy/sell ratio and volume analysis
-        - Market sentiment based on trading patterns
-        - Investment recommendation with detailed reasoning
-        - Risk factors and considerations
-        
-        ## Overall Trading Activity
-        Here's overall trading activity in recent time to put things into context regarding trends on other stocks.
-        {trades_summary_str}
-        """
-        
+        query = self.get_analysis_prompt(ticker, trades)
         result = await self.agent.run(query, output_type=StockTradesAnalysis)
         logging.info(f"Completed analysis for ticker {ticker}")
         return result.output
@@ -510,153 +447,11 @@ trades_test = trades.copy()
 trades_test.trades = [trade for trade in trades_test.trades if trade.ticker in ['AMD', 'MSFT']]
 trades_test.trades
 #%%
-trades_test=trades.trades
+analyses: InsiderTradingResults = await agent.analyze_all_tickers(trades_test)
 
 #%%
-analyses = await agent.analyze_all_tickers(trades_test)
+analyses.tickers['AMD'].recommendation
 
 #%%
 analyses
 #%%
-@agent.tool_plain
-def scrape_trades() -> str:
-    """
-    Scrapes trades data from Capitol Trades for a given page number.
-    
-    Args:
-        page (int): Page number to scrape trades from. Default is 1.
-        
-    Returns:
-        TradesData: Structured data containing trades made by politicians or insiders.
-    """
-    from agentic_stock_analysis.config import ROOT_DIR
-    with open(ROOT_DIR / 'mocks' / 'capitol_trades_scrape_sample.txt', 'r') as f:
-        capitol_trades_raw_data = f.read()
-    return clean_capitol_trades_markdown(capitol_trades_raw_data)
-#%%
-clean_capitol_trades_markdown(scrape_trades())
-
-#%%
-# Example usage
-inspect_agent(agent)
-#%%
-async def main():
-        # Run the analysis for the first page of trades
-        query = "Collect me trades from the politiciation. All of them."
-        result = await agent.run(query, output_type=TradesData)
-        print_response(result)
-        return result
-
-# Run the async main function
-result = await main()
-#%%
-print_response(result)
-
-type(result)
-#%%
-trades = result.output
-#%%
-trades.to_df().head(10)  # Display the first 10 trades
-
-#%%
-result = await agent.run("whats the biggest trade", output_type=str)
-        print_response(result)
-        return result
-
-#%%
-if __name__ == "__main__":
-    import asyncio
-
-    # Initialize the agent
-    agent = InsiderAnalystAgent(
-        model='openai:gpt-4o-mini',
-        name='Insider Analyst',
-        system_prompt=SYSTEM_PROMPT,
-    )
-
-    async def main():
-        # Run the analysis for the first page of trades
-        query = "Give me a mock trade?"
-        result = await agent.run(query, output_type=Trade)
-        print_response(result)
-        return result
-
-    # Run the async main function
-    result = await main()
-# %%
-#%%
-df_trades = trades.to_df()
-#%%
-df_trades.head(10)  # Display the first 10 trades
-#%%
-df_trades.value_counts('ticker')
-# %%
-summary = (
-    df_trades.groupby('ticker')
-    .agg(
-        total_amount=('amount', 'sum'),
-        buy_count=('transaction_type', lambda x: (x == 'buy').sum()),
-        sell_count=('transaction_type', lambda x: (x == 'sell').sum()),
-        buy_volume=('amount', lambda x: x[df_trades.loc[x.index, 'transaction_type'] == 'buy'].sum()),
-        sell_volume=('amount', lambda x: x[df_trades.loc[x.index, 'transaction_type'] == 'sell'].sum()),
-        last_trade_date=('transaction_date', 'max'),
-    )
-    .sort_values(['total_amount', 'buy_count'], ascending=False)
-    .head(10)
-)
-summary
-#%%
-io = summary[summary.index == 'AMD']
-#%%
-io = io.to_dict('records')[0]
-#%%
-str(io)
-#%%
-io2 = df_trades[df_trades['ticker'] == 'AMD'].sort_values('transaction_date', ascending=False).reset_index(drop=True)
-#%%
-io2.to_dict('records')
-#%%
-for ticker, row in summary.iterrows():
-    print(f"Ticker: {ticker}")
-    print(f"Total Amount: {row['total_amount']}")
-    print(f"Buy Count: {row['buy_count']}")
-    print(f"Sell Count: {row['sell_count']}")
-    print(f"Last Trade Date: {row['last_trade_date']}")
-    print("-" * 40)
-
-# %%
-summary['buy_count'].sum(), summary['sell_count'].sum(), summary['total_amount'].sum()
-#%%
-io = Trade.model_json_schema()
-#%%
-from agentic_stock_analysis.agents.utils import get_model_descriptions
-# %%
-def get_model_descriptions(pydantic_model: BaseModel) -> dict:
-    """
-    Extracts field descriptions and examples from a Pydantic model JSON schema.
-
-    Args:
-        schema: The JSON schema dictionary from model.model_json_schema().
-
-    Returns:
-        Dictionary mapping field names to their description and examples (if present).
-    """
-    schema = pydantic_model.model_json_schema()
-    result = {}
-    properties = schema.get("properties", {})
-    for field, meta in properties.items():
-        desc = meta.get("description", 'Not available')
-        examples = meta.get("examples", '')
-        result[field] = f'{meta.get("description")}'
-        if examples:
-            result[field] += f'. Examples: {", ".join(examples)}'
-    result_as_str = '\n'.join(f"{k}: {v}" for k, v in output.items())
-    return result_as_str
-
-# %%
-output = get_model_descriptions(Trade)
-#%%
-output
-# %%
-'\n'.join(f"{k}: {v}" for k, v in output.items())
-# %%

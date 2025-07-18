@@ -455,3 +455,42 @@ analyses.tickers['AMD'].recommendation
 #%%
 analyses
 #%%
+
+# %%
+# Test the agent
+async def main():
+    # Initialize the agent
+    insider_agent = InsiderAnalystAgent()
+
+    # Extract trades
+    print("Extracting trades...")
+    extracted_trades = await insider_agent.extract_trades()
+    if extracted_trades:
+        print(f"Successfully extracted {len(extracted_trades.trades)} trades.")
+        # Analyze all tickers
+        print("Analyzing all tickers...")
+        all_analyses = await insider_agent.analyze_all_tickers(extracted_trades)
+        
+        if all_analyses.tickers:
+            print("\n--- Analysis Results ---")
+            for ticker, analysis in all_analyses.tickers.items():
+                print(f"\nTicker: {analysis.ticker} ({analysis.company_name})")
+                print(f"  Signal: {analysis.signal.upper()}")
+                print(f"  Trend: {analysis.trend.capitalize()}")
+                print(f"  Buy Count: {analysis.buy_count}, Sell Count: {analysis.sell_count}")
+                print(f"  Total Volume: ${analysis.total_volume:,}")
+                print(f"  Recommendation:\n{analysis.recommendation}")
+            
+            print("\n--- Top Recommendations (by volume) ---")
+            top_recs = all_analyses.get_top_recommendations(3)
+            for rec in top_recs:
+                print(f"- {rec.ticker}: {rec.signal.upper()} (Volume: ${rec.total_volume:,})")
+        else:
+            print("No analyses generated.")
+    else:
+        print("Failed to extract any trades.")
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+    
